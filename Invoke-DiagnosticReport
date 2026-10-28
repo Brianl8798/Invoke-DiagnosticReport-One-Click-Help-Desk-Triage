@@ -1,0 +1,897 @@
+<#
+.SYNOPSIS
+    One-click diagnostic report for common help desk tickets
+    ("my computer is slow", "I can't connect to the internet").
+
+.DESCRIPTION
+    Collects the information a Tier 1 technician usually checks by hand and
+    produces a color-coded console summary plus a self-contained HTML report.
+
+    Checks performed:
+      - System   : OS, uptime, CPU load + top CPU processes, memory usage, admin context
+      - Updates  : pending reboot detection, days since the last Windows Update was installed
+      - Disk     : every fixed drive, flagged when free space is below a threshold (default 15%)
+      - Services : Spooler, BITS, WinRM, W32Time and other core services, flagged when stopped
+      - Network  : adapter IP config, ping default gateway, ping 8.8.8.8, DNS resolution test
+      - Events   : Critical and Error events from the System and Application logs (default last 24h)
+
+    Every result is rated OK / WARN / FAIL / INFO so problems stand out at a glance,
+    and every WARN / FAIL comes with a suggested fix.
+
+    Also produces a short plain-text ticket summary (saved as *_ticket.txt next to
+    the report and copied to the clipboard) ready to paste into a help desk ticket.
+
+    Compatible with Windows PowerShell 5.1 and PowerShell 7+. Read-only: it changes
+    nothing on the PC (apart from writing the report files and setting the clipboard).
+
+.PARAMETER UpdateWarnDays
+    Warn when the newest installed Windows update is older than this many days. Default: 30.
+
+.PARAMETER NoClipboard
+    Do not copy the ticket summary to the clipboard.
+
+.PARAMETER DiskFreeThresholdPercent
+    Drives with less free space than this percentage are flagged. Default: 15.
+
+.PARAMETER ServiceName
+    Services to check. Default: Spooler, BITS, WinRM, W32Time, Dhcp, Dnscache,
+    LanmanWorkstation, wuauserv.
+
+.PARAMETER PingTarget
+    External hosts to ping in addition to the default gateway. Default: 8.8.8.8.
+
+.PARAMETER DnsTestName
+    Host name used for the DNS resolution test. Default: www.microsoft.com.
+
+.PARAMETER EventLogHours
+    How many hours back to scan the event logs. Default: 24.
+
+.PARAMETER MaxEventGroups
+    Maximum number of grouped event entries (source + event ID) listed per log. Default: 15.
+
+.PARAMETER OutputPath
+    Where to save the HTML report. Default: the folder the script is stored in,
+    as DiagnosticReport_<COMPUTER>_<timestamp>.html
+
+.PARAMETER NoOpen
+    Do not open the HTML report automatically when finished.
+
+.PARAMETER NoPause
+    Never wait for Enter at the end (by default the script pauses only when it was
+    launched by double-click / "Run with PowerShell", so the window doesn't vanish).
+
+.PARAMETER PassThru
+    Output the result objects to the pipeline (useful for Export-Csv or further scripting).
+
+.EXAMPLE
+    .\Invoke-DiagnosticReport.ps1
+    Runs all checks with default settings and opens the HTML report.
+
+.EXAMPLE
+    .\Invoke-DiagnosticReport.ps1 -DiskFreeThresholdPercent 20 -EventLogHours 72 -NoOpen
+    Flags drives under 20% free, scans the last 3 days of events, and does not open the report.
+
+.EXAMPLE
+    .\Invoke-DiagnosticReport.ps1 -PassThru | Where-Object Status -eq 'FAIL'
+    Shows only failed checks as objects.
+
+.NOTES
+    Author  : Brian Lam
+    Version : 1.0.0
+    License : MIT
+
+    Run as Administrator for the most complete results (some event log and
+    service details can be limited for standard users).
+#>
+[CmdletBinding()]
+param(
+    [ValidateRange(1, 99)]
+    [int]$DiskFreeThresholdPercent = 15,
+
+    [string[]]$ServiceName = @('Spooler', 'BITS', 'WinRM', 'W32Time', 'Dhcp', 'Dnscache', 'LanmanWorkstation', 'wuauserv'),
+
+    [string[]]$PingTarget = @('8.8.8.8'),
+
+    [string]$DnsTestName = 'www.microsoft.com',
+
+    [ValidateRange(1, 365)]
+    [int]$UpdateWarnDays = 30,
+
+    [switch]$NoClipboard,
+
+    [ValidateRange(1, 720)]
+    [int]$EventLogHours = 24,
+
+    [ValidateRange(1, 100)]
+    [int]$MaxEventGroups = 15,
+
+    [string]$OutputPath,
+
+    [switch]$NoOpen,
+
+    [switch]$NoPause,
+
+    [switch]$PassThru
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# Folder the script lives in (falls back to the current folder if pasted into a console)
+$script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot }
+                    elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
+                    else { (Get-Location).Path }
+
+if (-not $OutputPath) {
+    $OutputPath = Join-Path $script:ScriptDir ('DiagnosticReport_{0}_{1:yyyyMMdd_HHmmss}.html' -f $env:COMPUTERNAME, (Get-Date))
+}
+
+# When launched by double-click / "Run with PowerShell", the window closes as soon as the
+# script ends. Detect that (the process was started just for this script) and pause instead.
+$script:ShouldPause = $false
+if (-not $NoPause -and $Host.Name -eq 'ConsoleHost') {
+    $cmdLine = [Environment]::CommandLine
+    $scriptName = Split-Path -Leaf $MyInvocation.MyCommand.Path
+    # "Run with PowerShell" uses:  powershell.exe -Command "... & 'C:\path\script.ps1'"
+    # Double-click / shortcuts use: powershell.exe -File "C:\path\script.ps1"
+    $launchedForThisScript = $scriptName -and $cmdLine -like "*$scriptName*" -and
+                             ($cmdLine -match '(?i)\s-File\s' -or $cmdLine -like "*& '*")
+    if ($launchedForThisScript -and $cmdLine -notmatch '(?i)-NoExit') {
+        $script:ShouldPause = $true
+    }
+}
+
+function Wait-BeforeExit {
+    if ($script:ShouldPause) {
+        Write-Host ''
+        Read-Host 'Press Enter to close this window' | Out-Null
+    }
+}
+
+# Safety net: any unexpected crash is shown on screen AND written to a log next to the script
+trap {
+    $logPath = Join-Path $script:ScriptDir 'DiagnosticReport_error.log'
+    $msg = "[{0:yyyy-MM-dd HH:mm:ss}] {1}`r`n{2}" -f (Get-Date), $_.Exception.Message, $_.ScriptStackTrace
+    try { $msg | Out-File -FilePath $logPath -Append -Encoding utf8 } catch { }
+    Write-Host ''
+    Write-Host "The script stopped because of an error:" -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  Details saved to: $logPath" -ForegroundColor Red
+    Wait-BeforeExit
+    exit 1
+}
+
+#region ---------- Helpers ----------
+
+$script:Results     = New-Object System.Collections.Generic.List[object]
+$script:EventGroups = New-Object System.Collections.Generic.List[object]
+
+function Add-Result {
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][string]$Check,
+        [Parameter(Mandatory)][ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$Status,
+        [string]$Detail = '',
+        # Suggested fix. Wrap commands in [[ ]] so the HTML report shows them as code.
+        [string]$Fix = ''
+    )
+    $script:Results.Add([pscustomobject]@{
+        Category = $Category
+        Check    = $Check
+        Status   = $Status
+        Detail   = $Detail
+        Fix      = (ConvertTo-PlainFix $Fix)
+        FixRaw   = $Fix
+    })
+
+    $color = switch ($Status) {
+        'OK'   { 'Green' }
+        'WARN' { 'Yellow' }
+        'FAIL' { 'Red' }
+        default { 'Gray' }
+    }
+    Write-Host ('  [{0,-4}] ' -f $Status) -ForegroundColor $color -NoNewline
+    Write-Host ('{0}: {1}' -f $Check, $Detail)
+    if ($Fix -and $Status -in 'WARN', 'FAIL') {
+        Write-Host ('         Fix: {0}' -f (ConvertTo-PlainFix $Fix)) -ForegroundColor DarkCyan
+    }
+}
+
+function ConvertTo-PlainFix {
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    return ($Text -replace '\[\[(.+?)\]\]', '$1')
+}
+
+function ConvertTo-HtmlFix {
+    # HTML-encode first, then turn [[command]] into <code>command</code>
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    $safe = [System.Net.WebUtility]::HtmlEncode($Text)
+    return ($safe -replace '\[\[(.+?)\]\]', '<code>$1</code>')
+}
+
+# Plain-English meaning + fix for event IDs a help desk tech sees all the time.
+# Provider is matched with -like, so '*' means "any source".
+$script:EventKnowledge = @(
+    @{ Id = 41;    Provider = '*Kernel-Power*';  Meaning = 'PC lost power or restarted without shutting down cleanly (crash, freeze, power cut or held power button).'; Fix = 'Check power cable/battery and PSU, look for overheating, update chipset/GPU drivers. Review crash history with [[perfmon /rel]].' }
+    @{ Id = 6008;  Provider = '*EventLog*';      Meaning = 'The previous shutdown was unexpected.'; Fix = 'Same causes as Kernel-Power 41. Ask the user if the PC froze or was force-powered off; check [[perfmon /rel]].' }
+    @{ Id = 1001;  Provider = '*WER-SystemErrorReporting*'; Meaning = 'Blue screen (BSOD). Windows recorded a bug check.'; Fix = 'Note the stop code in the message, update drivers, run [[sfc /scannow]] and check dumps in C:\Windows\Minidump.' }
+    @{ Id = 7031;  Provider = '*Service Control Manager*'; Meaning = 'A service crashed unexpectedly (the message names which one).'; Fix = 'Restart that service with [[Start-Service <name>]]; if it repeats, update or reinstall the app that owns it.' }
+    @{ Id = 7034;  Provider = '*Service Control Manager*'; Meaning = 'A service terminated unexpectedly (the message names which one).'; Fix = 'Restart that service with [[Start-Service <name>]]; if it repeats, update or reinstall the app that owns it.' }
+    @{ Id = 7000;  Provider = '*Service Control Manager*'; Meaning = 'A service failed to start.'; Fix = 'Open [[services.msc]], check the service''s dependencies and Log On account, then try starting it again.' }
+    @{ Id = 7009;  Provider = '*Service Control Manager*'; Meaning = 'A service took too long to start (timeout).'; Fix = 'Often caused by a slow boot or busy disk. Restart the PC; if it persists, check disk health and startup apps.' }
+    @{ Id = 7023;  Provider = '*Service Control Manager*'; Meaning = 'A service stopped with an error.'; Fix = 'Check the error text in the message, then restart the service from [[services.msc]].' }
+    @{ Id = 10016; Provider = '*COM*'; Meaning = 'DCOM permission warning. Very common and almost always harmless.'; Fix = 'Safe to ignore unless a specific app is failing.' }
+    @{ Id = 10010; Provider = '*COM*'; Meaning = 'A DCOM server did not register in time. Usually harmless.'; Fix = 'Safe to ignore unless a specific app is failing.' }
+    @{ Id = 1014;  Provider = '*DNS Client*';    Meaning = 'DNS name resolution timed out.'; Fix = 'Run [[ipconfig /flushdns]] and check the DNS servers shown in the Network section.' }
+    @{ Id = 4199;  Provider = '*Tcpip*';         Meaning = 'IP address conflict: another device is using the same IP.'; Fix = 'Run [[ipconfig /release]] then [[ipconfig /renew]]; check for duplicate static IPs.' }
+    @{ Id = 7;     Provider = '*disk*';          Meaning = 'Bad block found on a disk. The drive may be failing.'; Fix = 'Back up the user''s data now, then check health with [[Get-PhysicalDisk | Select FriendlyName, HealthStatus]] and run [[chkdsk C: /r]].' }
+    @{ Id = 51;    Provider = '*disk*';          Meaning = 'Error during a paging operation. Possible disk or cable problem.'; Fix = 'Check disk health with [[Get-PhysicalDisk | Select FriendlyName, HealthStatus]]; reseat/replace the cable or drive.' }
+    @{ Id = 153;   Provider = '*disk*';          Meaning = 'Disk I/O had to be retried. Early warning of a disk or controller problem.'; Fix = 'Check disk health with [[Get-PhysicalDisk | Select FriendlyName, HealthStatus]] and update storage drivers.' }
+    @{ Id = 129;   Provider = '*';               Meaning = 'Storage controller reset. Disk or driver problem.'; Fix = 'Update storage/chipset drivers and check disk health.' }
+    @{ Id = 55;    Provider = '*Ntfs*';          Meaning = 'File system corruption detected.'; Fix = 'Run [[chkdsk C: /f]] (needs a restart for the system drive).' }
+    @{ Id = 1000;  Provider = '*Application Error*'; Meaning = 'An application crashed (the message names the app).'; Fix = 'Update, repair or reinstall that app. If it''s a Windows component, run [[sfc /scannow]].' }
+    @{ Id = 1002;  Provider = '*Application Hang*';  Meaning = 'An application stopped responding (the message names the app).'; Fix = 'Update the app; check Memory/Disk usage in [[taskmgr]] while it runs.' }
+    @{ Id = 1026;  Provider = '*.NET Runtime*';  Meaning = 'A .NET application crashed with an unhandled error.'; Fix = 'Update or reinstall the app named in the message; install the latest .NET updates via Windows Update.' }
+    @{ Id = 20;    Provider = '*WindowsUpdateClient*'; Meaning = 'A Windows Update failed to install.'; Fix = 'Run [[DISM /Online /Cleanup-Image /RestoreHealth]] then [[sfc /scannow]], restart, and retry Windows Update.' }
+    @{ Id = 36887; Provider = '*Schannel*';      Meaning = 'TLS/SSL alert from a remote server. Usually harmless.'; Fix = 'Safe to ignore unless the user reports a specific website or app failing to connect.' }
+)
+
+function Get-EventAdvice {
+    param([int]$Id, [string]$Provider)
+    foreach ($k in $script:EventKnowledge) {
+        if ($k.Id -eq $Id -and $Provider -like $k.Provider) { return $k }
+    }
+    return $null
+}
+
+function Write-Section {
+    param([string]$Title)
+    Write-Host ''
+    Write-Host ("== $Title ==") -ForegroundColor Cyan
+}
+
+function Test-PingHost {
+    param(
+        [Parameter(Mandatory)][string]$Target,
+        [int]$Count = 4,
+        [int]$TimeoutMs = 1000
+    )
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    $received = 0
+    $times = @()
+    try {
+        for ($i = 0; $i -lt $Count; $i++) {
+            try {
+                $reply = $ping.Send($Target, $TimeoutMs)
+                if ($reply.Status -eq 'Success') {
+                    $received++
+                    $times += $reply.RoundtripTime
+                }
+            } catch {
+                # Unreachable / unresolvable host counts as a lost packet
+            }
+        }
+    } finally {
+        $ping.Dispose()
+    }
+
+    $avg = $null
+    if ($times.Count -gt 0) { $avg = [math]::Round(($times | Measure-Object -Average).Average, 0) }
+
+    [pscustomobject]@{
+        Target   = $Target
+        Sent     = $Count
+        Received = $received
+        AvgMs    = $avg
+    }
+}
+
+function Add-PingResult {
+    param([string]$Label, [string]$Target, [string]$FailFix = '')
+    $p = Test-PingHost -Target $Target
+    if ($p.Received -eq 0) {
+        Add-Result 'Network' $Label 'FAIL' ("{0}: no replies (0/{1})" -f $Target, $p.Sent) -Fix $FailFix
+        return $false
+    }
+    $slowFix = 'Try a wired connection or move closer to the Wi-Fi router, restart the router, and check for apps using heavy bandwidth (downloads, cloud sync, streaming).'
+    $detail = "{0}: {1}/{2} replies, avg {3} ms" -f $Target, $p.Received, $p.Sent, $p.AvgMs
+    if ($p.Received -lt $p.Sent) {
+        Add-Result 'Network' $Label 'WARN' "$detail (packet loss)" -Fix $slowFix
+    } elseif ($p.AvgMs -gt 150) {
+        Add-Result 'Network' $Label 'WARN' "$detail (high latency)" -Fix $slowFix
+    } else {
+        Add-Result 'Network' $Label 'OK' $detail
+    }
+    return $true
+}
+
+function ConvertTo-HtmlSafe {
+    param([object]$Text)
+    if ($null -eq $Text) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode([string]$Text)
+}
+
+#endregion
+
+$reportStart = Get-Date
+Write-Host ''
+Write-Host "One-Click Diagnostic Report - $env:COMPUTERNAME - $($reportStart.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor White
+
+#region ---------- System ----------
+
+Write-Section 'System'
+$os = $null
+try {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem
+    Add-Result 'System' 'Operating system' 'INFO' ("{0} (build {1})" -f $os.Caption, $os.BuildNumber)
+} catch {
+    Add-Result 'System' 'Operating system' 'WARN' "Could not query OS info: $($_.Exception.Message)" -Fix 'Run PowerShell as Administrator and try again. If it still fails, repair WMI with [[winmgmt /verifyrepository]].'
+}
+
+try {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+    Add-Result 'System' 'Computer' 'INFO' ("{0} ({1} {2})" -f $env:COMPUTERNAME, $cs.Manufacturer, $cs.Model)
+} catch {
+    Add-Result 'System' 'Computer' 'INFO' $env:COMPUTERNAME
+}
+
+try {
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+    $adminText = if ($isAdmin) { 'Yes' } else { 'No - some results may be limited' }
+} catch {
+    $adminText = 'Unknown'
+}
+Add-Result 'System' 'Logged-on user' 'INFO' ("{0} - running as admin: {1}" -f $env:USERNAME, $adminText)
+
+$script:OsText     = 'Unknown OS'
+$script:TicketUptime = 'unknown'
+if ($os) { $script:OsText = '{0} (build {1})' -f $os.Caption, $os.BuildNumber }
+
+# CPU: overall load plus the processes using the most CPU right now (a snapshot)
+try {
+    $cores = [Environment]::ProcessorCount
+    $loadValues = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+        Where-Object { $null -ne $_.LoadPercentage } |
+        ForEach-Object { [double]$_.LoadPercentage })
+    $cpuLoad = $null
+    if ($loadValues.Count -gt 0) { $cpuLoad = [math]::Round(($loadValues | Measure-Object -Average).Average, 0) }
+
+    $topCpuText = ''
+    try {
+        # PercentProcessorTime is per core, so divide by core count to get % of the whole CPU.
+        # Names like "chrome#3" are extra instances of the same program.
+        $topCpuText = (Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop |
+            Where-Object { $_.Name -notin '_Total', 'Idle' -and $_.PercentProcessorTime -gt 0 } |
+            Sort-Object -Property PercentProcessorTime -Descending |
+            Select-Object -First 3 |
+            ForEach-Object { '{0} ({1}%)' -f ($_.Name -replace '#\d+$', ''), [math]::Round($_.PercentProcessorTime / $cores, 0) }) -join ', '
+    } catch { }
+    if (-not $topCpuText) { $topCpuText = 'nothing significant' }
+
+    $cpuDetail = if ($null -ne $cpuLoad) { '{0}% load, {1} logical cores. Top right now: {2}' -f $cpuLoad, $cores, $topCpuText }
+                 else { '{0} logical cores. Top right now: {1}' -f $cores, $topCpuText }
+
+    if ($null -ne $cpuLoad -and $cpuLoad -ge 85) {
+        Add-Result 'System' 'CPU' 'WARN' "$cpuDetail - CPU is very busy" -Fix 'Open [[taskmgr]] > Processes and sort by CPU. Close or update the program at the top. "Antimalware Service Executable" or "Windows Modules Installer" usually means a scan or update is running - let it finish. If an unknown process is always high, run a full scan in Windows Security.'
+    } else {
+        Add-Result 'System' 'CPU' 'OK' $cpuDetail
+    }
+} catch {
+    Add-Result 'System' 'CPU' 'WARN' "Could not query CPU: $($_.Exception.Message)" -Fix 'Run PowerShell as Administrator and try again, or check CPU usage in [[taskmgr]].'
+}
+
+if ($os) {
+    $uptime = (Get-Date) - $os.LastBootUpTime
+    $uptimeText = '{0}d {1}h {2}m (last boot {3:yyyy-MM-dd HH:mm})' -f $uptime.Days, $uptime.Hours, $uptime.Minutes, $os.LastBootUpTime
+    $script:TicketUptime = '{0}d {1}h' -f $uptime.Days, $uptime.Hours
+    if ($uptime.TotalDays -ge 7) {
+        Add-Result 'System' 'Uptime' 'WARN' "$uptimeText - reboot recommended" -Fix 'Save work and restart the PC (Start > Power > Restart, or [[Restart-Computer]]). A restart clears memory leaks and finishes pending updates. Note: Shut Down with Fast Startup does not reset uptime.'
+    } else {
+        Add-Result 'System' 'Uptime' 'OK' $uptimeText
+    }
+
+    # Win32_OperatingSystem reports memory in KB
+    $totalGB = $os.TotalVisibleMemorySize / 1MB
+    $freeGB  = $os.FreePhysicalMemory / 1MB
+    $usedPct = [math]::Round((1 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize)) * 100, 0)
+    $memText = '{0}% used ({1:N1} GB free of {2:N1} GB)' -f $usedPct, $freeGB, $totalGB
+    if ($usedPct -ge 90) {
+        $topProcs = ''
+        try {
+            $topProcs = (Get-Process -ErrorAction Stop |
+                Sort-Object -Property WorkingSet64 -Descending |
+                Select-Object -First 3 |
+                ForEach-Object { '{0} ({1:N0} MB)' -f $_.ProcessName, ($_.WorkingSet64 / 1MB) }) -join ', '
+        } catch { }
+        $memFix = 'Open [[taskmgr]] > Processes, sort by Memory and close what the user doesn''t need. Restarting also frees memory.'
+        if ($topProcs) { $memFix = "Biggest users right now: $topProcs. $memFix" }
+        Add-Result 'System' 'Memory' 'WARN' "$memText - memory pressure likely" -Fix $memFix
+    } else {
+        Add-Result 'System' 'Memory' 'OK' $memText
+    }
+}
+
+#endregion
+
+#region ---------- Updates & restart ----------
+
+Write-Section 'Updates & restart'
+
+# 1. Pending reboot - Windows leaves these markers when it is waiting on a restart
+$rebootReasons = @()
+try {
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        $rebootReasons += 'Windows Update'
+    }
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        $rebootReasons += 'Windows component install/servicing'
+    }
+    try {
+        $sm = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction Stop
+        if ($sm.PendingFileRenameOperations) { $rebootReasons += 'files waiting to be replaced (installer or update)' }
+    } catch { }
+    try {
+        $activeName  = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name 'ComputerName' -ErrorAction Stop).ComputerName
+        $pendingName = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name 'ComputerName' -ErrorAction Stop).ComputerName
+        if ($activeName -and $pendingName -and $activeName -ne $pendingName) { $rebootReasons += "computer rename to $pendingName" }
+    } catch { }
+
+    if ($rebootReasons.Count -gt 0) {
+        Add-Result 'Updates' 'Pending reboot' 'WARN' ('Restart required: {0}' -f ($rebootReasons -join '; ')) -Fix 'Save work and restart the PC with [[Restart-Computer]]. Updates and installs are not finished until it restarts, and a pending restart can cause slowness, failed installs and odd errors.'
+    } else {
+        Add-Result 'Updates' 'Pending reboot' 'OK' 'No restart pending'
+    }
+} catch {
+    Add-Result 'Updates' 'Pending reboot' 'WARN' "Could not check: $($_.Exception.Message)" -Fix 'Run PowerShell as Administrator and try again.'
+}
+
+# 2. Last Windows Update - newest installed hotfix / cumulative update
+try {
+    $newest = $null
+    $newestKb = ''
+    foreach ($hf in @(Get-HotFix -ErrorAction Stop)) {
+        try {
+            if ($hf.InstalledOn) {
+                $when = [datetime]$hf.InstalledOn
+                if (-not $newest -or $when -gt $newest) { $newest = $when; $newestKb = $hf.HotFixID }
+            }
+        } catch { }  # some entries have unreadable dates - skip them
+    }
+
+    $wuFix = 'Open Windows Update with [[start ms-settings:windowsupdate]] and click "Check for updates". If updates keep failing, run [[DISM /Online /Cleanup-Image /RestoreHealth]] then [[sfc /scannow]] and try again.'
+    if (-not $newest) {
+        Add-Result 'Updates' 'Last Windows Update' 'WARN' 'No installed updates with a date were found' -Fix $wuFix
+    } else {
+        $days = [int][math]::Floor(((Get-Date) - $newest).TotalDays)
+        $detail = 'Newest update {0} installed {1:yyyy-MM-dd} ({2} days ago)' -f $newestKb, $newest, $days
+        if ($days -gt ($UpdateWarnDays * 3)) {
+            Add-Result 'Updates' 'Last Windows Update' 'FAIL' "$detail - badly out of date" -Fix $wuFix
+        } elseif ($days -gt $UpdateWarnDays) {
+            Add-Result 'Updates' 'Last Windows Update' 'WARN' "$detail - older than $UpdateWarnDays days" -Fix $wuFix
+        } else {
+            Add-Result 'Updates' 'Last Windows Update' 'OK' $detail
+        }
+    }
+} catch {
+    Add-Result 'Updates' 'Last Windows Update' 'WARN' "Could not read update history: $($_.Exception.Message)" -Fix 'Check manually in Settings > Windows Update > Update history.'
+}
+
+#endregion
+
+#region ---------- Disk ----------
+
+Write-Section "Disk (flag below $DiskFreeThresholdPercent% free)"
+try {
+    $disks = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3')
+    if ($disks.Count -eq 0) {
+        Add-Result 'Disk' 'Fixed drives' 'WARN' 'No fixed drives found' -Fix 'Run PowerShell as Administrator and try again.'
+    }
+    foreach ($d in $disks) {
+        if (-not $d.Size) { continue }
+        $freePct = [math]::Round(($d.FreeSpace / $d.Size) * 100, 1)
+        $detail  = '{0:N1} GB free of {1:N1} GB ({2}% free)' -f ($d.FreeSpace / 1GB), ($d.Size / 1GB), $freePct
+        $label   = if ($d.VolumeName) { "$($d.DeviceID) ($($d.VolumeName))" } else { $d.DeviceID }
+
+        if ($freePct -lt $DiskFreeThresholdPercent) {
+            $letter = $d.DeviceID.TrimEnd(':')
+            $diskFix = 'Run Disk Cleanup with [[cleanmgr /d {0}]] (click "Clean up system files"), empty the Recycle Bin, and clear temp files with [[Remove-Item $env:TEMP\* -Recurse -Force -ErrorAction SilentlyContinue]]. Then check Settings > System > Storage for large folders and unused apps.' -f $letter
+            Add-Result 'Disk' $label 'FAIL' "$detail - below $DiskFreeThresholdPercent% threshold" -Fix $diskFix
+        } else {
+            Add-Result 'Disk' $label 'OK' $detail
+        }
+    }
+} catch {
+    Add-Result 'Disk' 'Disk query' 'WARN' "Could not query disks: $($_.Exception.Message)" -Fix 'Run PowerShell as Administrator and try again.'
+}
+
+#endregion
+
+#region ---------- Services ----------
+
+Write-Section 'Critical services'
+
+# What breaks when each service is down - helps explain the problem to the user
+$serviceImpact = @{
+    'Spooler'           = 'Printing will not work.'
+    'BITS'              = 'Windows Update and some background downloads will not work.'
+    'WinRM'             = 'Remote PowerShell / remote management of this PC will not work.'
+    'W32Time'           = 'The clock may drift; a wrong time breaks domain logins and HTTPS certificates.'
+    'Dhcp'              = 'The PC cannot get an IP address automatically.'
+    'Dnscache'          = 'Website and server names may fail to resolve.'
+    'LanmanWorkstation' = 'Mapped drives and network file shares will not work.'
+    'wuauserv'          = 'Windows Update will not work.'
+}
+
+# Extra steps for services that have a well-known follow-up fix
+$serviceExtraFix = @{
+    'Spooler' = ' If it keeps stopping, clear stuck print jobs: [[Stop-Service Spooler -Force]], delete the files in C:\Windows\System32\spool\PRINTERS, then [[Start-Service Spooler]].'
+    'W32Time' = ' Then resync the clock with [[w32tm /resync]].'
+    'WinRM'   = ' To fully set up remoting, run [[Enable-PSRemoting -Force]].'
+}
+
+foreach ($name in $ServiceName) {
+    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Add-Result 'Services' $name 'WARN' 'Service not found on this system' -Fix 'Check the service name with [[Get-Service *name*]]. Some services do not exist on every Windows edition.'
+        continue
+    }
+
+    $label     = '{0} ({1})' -f $svc.DisplayName, $svc.Name
+    $startType = [string]$svc.StartType
+    $impact    = if ($serviceImpact.ContainsKey($svc.Name)) { $serviceImpact[$svc.Name] + ' ' } else { '' }
+    $extra     = if ($serviceExtraFix.ContainsKey($svc.Name)) { $serviceExtraFix[$svc.Name] } else { '' }
+
+    if ($svc.Status -eq 'Running') {
+        Add-Result 'Services' $label 'OK' "Running (startup: $startType)"
+    } elseif ($startType -eq 'Automatic') {
+        $fix = '{0}Start it with [[Start-Service {1}]] (admin PowerShell).{2} If it stops again, check Event Logs below for a Service Control Manager error.' -f $impact, $svc.Name, $extra
+        Add-Result 'Services' $label 'FAIL' "$($svc.Status) - startup type is Automatic, should be running" -Fix $fix
+    } elseif ($startType -eq 'Disabled') {
+        $fix = '{0}Someone may have disabled it on purpose. If it is needed: [[Set-Service {1} -StartupType Automatic]] then [[Start-Service {1}]].{2}' -f $impact, $svc.Name, $extra
+        Add-Result 'Services' $label 'WARN' "$($svc.Status) - service is Disabled" -Fix $fix
+    } else {
+        # Manual services start on demand, so "stopped" is normal and not a problem
+        Add-Result 'Services' $label 'INFO' "$($svc.Status) (startup: $startType - starts on demand, this is normal)"
+    }
+}
+
+#endregion
+
+#region ---------- Network ----------
+
+Write-Section 'Network connectivity'
+$gatewayOk  = $null
+$internetOk = $null
+$dnsOk      = $null
+
+try {
+    $adapters = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True')
+    foreach ($a in $adapters) {
+        $ipv4 = @($a.IPAddress | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }) -join ', '
+        $dns  = @($a.DNSServerSearchOrder) -join ', '
+        if (-not $dns) { $dns = 'none' }
+        $dhcp = if ($a.DHCPEnabled) { 'DHCP' } else { 'Static' }
+        $adapterName = if ($a.Description) { $a.Description } else { 'Network adapter' }
+        Add-Result 'Network' $adapterName 'INFO' ("IP {0} ({1}), DNS {2}" -f $ipv4, $dhcp, $dns)
+
+        if ($ipv4 -match '^169\.254\.') {
+            Add-Result 'Network' 'APIPA address' 'FAIL' "$adapterName has a 169.254.x.x address - DHCP server not reached" -Fix 'Check the cable or Wi-Fi connection, then run [[ipconfig /release]] and [[ipconfig /renew]]. If it still fails, restart the router and make sure the DHCP Client service is running. (Ignore this for unused or virtual adapters.)'
+        }
+    }
+
+    $gateways = @($adapters |
+        ForEach-Object { $_.DefaultIPGateway } |
+        Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
+        Select-Object -Unique)
+} catch {
+    Add-Result 'Network' 'Adapter info' 'WARN' "Could not read adapter configuration: $($_.Exception.Message)" -Fix 'Run PowerShell as Administrator, or check adapters manually with [[ipconfig /all]].'
+    $gateways = @()
+}
+
+# 1. Default gateway
+if ($gateways.Count -eq 0) {
+    Add-Result 'Network' 'Ping default gateway' 'FAIL' 'No default gateway configured - check cable / Wi-Fi / DHCP' -Fix 'Make sure the PC is connected (cable plugged in / Wi-Fi joined) and the adapter is enabled: [[Get-NetAdapter]]. Then run [[ipconfig /renew]].'
+    $gatewayOk = $false
+} else {
+    $gatewayOk = $false
+    $gwFix = 'Check the cable or Wi-Fi connection, restart the router, then run [[ipconfig /renew]]. If the PC is on Wi-Fi, forget and rejoin the network.'
+    foreach ($gw in $gateways) {
+        if (Add-PingResult -Label 'Ping default gateway' -Target $gw -FailFix $gwFix) { $gatewayOk = $true }
+    }
+}
+
+# 2. External hosts (default 8.8.8.8)
+$internetOk = $false
+$extFix = 'The local network works but traffic is not leaving it. Restart the modem/router, check the ISP status, and disconnect any VPN or proxy. Some company networks block ping to 8.8.8.8, so also try opening a website.'
+foreach ($t in $PingTarget) {
+    if (Add-PingResult -Label 'Ping external host' -Target $t -FailFix $extFix) { $internetOk = $true }
+}
+
+# 3. DNS resolution
+$dnsFix = ('Clear the DNS cache with [[ipconfig /flushdns]]. Test a public DNS server with [[Resolve-DnsName {0} -Server 8.8.8.8]]: if that works, the PC''s configured DNS server is the problem. ' +
+           'Last resort: [[netsh winsock reset]] and restart.') -f $DnsTestName
+try {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    if (Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue) {
+        # -DnsOnly skips the hosts file / NetBIOS so we really test the DNS server
+        $answers = @(Resolve-DnsName -Name $DnsTestName -DnsOnly -ErrorAction Stop |
+            Where-Object { $_.PSObject.Properties['IPAddress'] -and $_.IPAddress } |
+            Select-Object -ExpandProperty IPAddress)
+    } else {
+        $answers = @([System.Net.Dns]::GetHostAddresses($DnsTestName) | ForEach-Object { $_.IPAddressToString })
+    }
+    $sw.Stop()
+
+    if ($answers.Count -gt 0) {
+        Add-Result 'Network' 'DNS resolution' 'OK' ('{0} -> {1} ({2} ms)' -f $DnsTestName, (($answers | Select-Object -First 3) -join ', '), $sw.ElapsedMilliseconds)
+        $dnsOk = $true
+    } else {
+        Add-Result 'Network' 'DNS resolution' 'FAIL' "$DnsTestName returned no addresses" -Fix $dnsFix
+        $dnsOk = $false
+    }
+} catch {
+    Add-Result 'Network' 'DNS resolution' 'FAIL' "$DnsTestName could not be resolved: $($_.Exception.Message)" -Fix $dnsFix
+    $dnsOk = $false
+}
+
+# Plain-English interpretation of the three network tests
+$diagnosis = if (-not $gatewayOk) {
+    'Local network problem: the gateway is unreachable. Check cable/Wi-Fi, adapter status and IP configuration.'
+} elseif (-not $internetOk) {
+    'Gateway reachable but internet is not. Likely router/ISP/firewall issue upstream of this PC.'
+} elseif (-not $dnsOk) {
+    'Internet reachable by IP but name resolution fails. DNS problem: check DNS servers, try ipconfig /flushdns.'
+} else {
+    'Gateway, internet and DNS all working. Connectivity is not the cause.'
+}
+Add-Result 'Network' 'Diagnosis' 'INFO' $diagnosis
+
+#endregion
+
+#region ---------- Event logs ----------
+
+Write-Section "Event logs (Critical + Error, last $EventLogHours h)"
+$since = (Get-Date).AddHours(-$EventLogHours)
+
+foreach ($log in @('System', 'Application')) {
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{ LogName = $log; Level = 1, 2; StartTime = $since } -ErrorAction Stop)
+    } catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $_.Exception.Message -like '*No events were found*') {
+            $events = @()
+        } else {
+            Add-Result 'Event Logs' "$log log" 'WARN' "Could not read log: $($_.Exception.Message)" -Fix 'Run PowerShell as Administrator and try again.'
+            continue
+        }
+    }
+
+    $critical = @($events | Where-Object { $_.Level -eq 1 }).Count
+    $errors   = @($events | Where-Object { $_.Level -eq 2 }).Count
+    $summary  = '{0} critical, {1} error event(s)' -f $critical, $errors
+    $logFix   = 'See "Event details" in the HTML report for what each event means. Open the full log with [[eventvwr.msc]] > Windows Logs > {0}.' -f $log
+
+    if ($critical -gt 0) {
+        Add-Result 'Event Logs' "$log log" 'FAIL' $summary -Fix $logFix
+    } elseif ($errors -gt 0) {
+        Add-Result 'Event Logs' "$log log" 'WARN' $summary -Fix $logFix
+    } else {
+        Add-Result 'Event Logs' "$log log" 'OK' 'No critical or error events'
+    }
+
+    # Group repeat offenders so 200 copies of the same error become one line
+    $groups = $events |
+        Group-Object -Property ProviderName, Id |
+        Sort-Object -Property Count -Descending |
+        Select-Object -First $MaxEventGroups
+
+    foreach ($g in $groups) {
+        $latest = $g.Group | Sort-Object -Property TimeCreated -Descending | Select-Object -First 1
+        $msg = '(no message text)'
+        if ($latest.Message) { $msg = (($latest.Message -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 1) }
+        if (-not $msg) { $msg = '(no message text)' }
+        if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 197) + '...' }
+
+        $advice = Get-EventAdvice -Id $latest.Id -Provider $latest.ProviderName
+        $script:EventGroups.Add([pscustomobject]@{
+            Log      = $log
+            Level    = $(if ($latest.Level -eq 1) { 'Critical' } else { 'Error' })
+            Source   = $latest.ProviderName
+            EventId  = $latest.Id
+            Count    = $g.Count
+            LastSeen = $latest.TimeCreated
+            Message  = $msg
+            Meaning  = $(if ($advice) { $advice.Meaning } else { '' })
+            FixRaw   = $(if ($advice) { $advice.Fix } else { '' })
+        })
+    }
+}
+
+$topEvents = @($script:EventGroups | Sort-Object -Property Count -Descending | Select-Object -First 5)
+if ($topEvents.Count -gt 0) {
+    Write-Host '  Most frequent:' -ForegroundColor DarkGray
+    foreach ($e in $topEvents) {
+        Write-Host ('    {0,4}x  {1} {2} (ID {3})' -f $e.Count, $e.Log, $e.Source, $e.EventId) -ForegroundColor DarkGray
+        if ($e.Meaning) {
+            Write-Host ('           {0}' -f $e.Meaning) -ForegroundColor DarkGray
+        }
+    }
+}
+
+#endregion
+
+#region ---------- Summary + HTML report ----------
+
+$okCount   = @($script:Results | Where-Object Status -eq 'OK').Count
+$warnCount = @($script:Results | Where-Object Status -eq 'WARN').Count
+$failCount = @($script:Results | Where-Object Status -eq 'FAIL').Count
+$duration  = [math]::Round(((Get-Date) - $reportStart).TotalSeconds, 1)
+
+if ($failCount -gt 0)     { $overall = 'Issues found';  $overallClass = 'fail' }
+elseif ($warnCount -gt 0) { $overall = 'Warnings';      $overallClass = 'warn' }
+else                      { $overall = 'Healthy';       $overallClass = 'ok' }
+
+$sectionsHtml = foreach ($cat in @('System', 'Updates', 'Disk', 'Services', 'Network', 'Event Logs')) {
+    $rows = foreach ($r in ($script:Results | Where-Object Category -eq $cat)) {
+        $fixCell = if ($r.Status -in 'WARN', 'FAIL') { ConvertTo-HtmlFix $r.FixRaw } else { '' }
+        "<tr><td><span class='badge {0}'>{1}</span></td><td>{2}</td><td>{3}</td><td class='fix'>{4}</td></tr>" -f `
+            $r.Status.ToLower(), $r.Status, (ConvertTo-HtmlSafe $r.Check), (ConvertTo-HtmlSafe $r.Detail), $fixCell
+    }
+    if (-not $rows) { continue }
+    "<h2>$cat</h2><table><thead><tr><th class='s'>Status</th><th class='c'>Check</th><th class='d'>Detail</th><th>Suggested fix</th></tr></thead><tbody>$($rows -join "`n")</tbody></table>"
+}
+
+$eventRows = foreach ($e in ($script:EventGroups | Sort-Object -Property Count -Descending)) {
+    $adviceCell = ''
+    if ($e.Meaning) { $adviceCell = '<b>{0}</b><br>{1}' -f (ConvertTo-HtmlSafe $e.Meaning), (ConvertTo-HtmlFix $e.FixRaw) }
+    else { $adviceCell = "<span class='muted'>Not in the built-in list. Search the source + event ID online.</span>" }
+    "<tr><td>{0}</td><td><span class='badge {1}'>{2}</span></td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6:yyyy-MM-dd HH:mm}</td><td>{7}</td><td class='fix'>{8}</td></tr>" -f `
+        $e.Log, $(if ($e.Level -eq 'Critical') { 'fail' } else { 'warn' }), $e.Level,
+        (ConvertTo-HtmlSafe $e.Source), $e.EventId, $e.Count, $e.LastSeen, (ConvertTo-HtmlSafe $e.Message), $adviceCell
+}
+$eventHtml = if ($eventRows) {
+    "<h2>Event details (grouped by source + ID)</h2><table><thead><tr><th>Log</th><th>Level</th><th>Source</th><th>ID</th><th>Count</th><th>Last seen</th><th>Message</th><th>What it means / fix</th></tr></thead><tbody>$($eventRows -join "`n")</tbody></table>"
+} else { '' }
+
+# Recommended actions: every FAIL first, then every WARN, each with its fix
+$actionItems = foreach ($r in @($script:Results | Where-Object { $_.Status -eq 'FAIL' -and $_.FixRaw }) + @($script:Results | Where-Object { $_.Status -eq 'WARN' -and $_.FixRaw })) {
+    "<li><span class='badge {0}'>{1}</span> <b>{2}</b> - {3}<div class='fix'>{4}</div></li>" -f `
+        $r.Status.ToLower(), $r.Status, (ConvertTo-HtmlSafe $r.Check), (ConvertTo-HtmlSafe $r.Detail), (ConvertTo-HtmlFix $r.FixRaw)
+}
+$actionsHtml = if ($actionItems) {
+    "<div class='actions'><h2>Recommended actions</h2><ol>$($actionItems -join "`n")</ol><div class='muted'>Fixes are suggestions only - this script does not change anything on the PC.</div></div>"
+} else {
+    "<div class='actions'><h2>Recommended actions</h2><p>Nothing to fix - all checks passed.</p></div>"
+}
+
+# ---------- Ticket summary (plain text, ready to paste into a ticket) ----------
+$ticketPath = [System.IO.Path]::ChangeExtension($OutputPath, $null).TrimEnd('.') + '_ticket.txt'
+$categories = @('System', 'Updates', 'Disk', 'Services', 'Network', 'Event Logs')
+$issues     = @($script:Results | Where-Object { $_.Status -eq 'FAIL' }) + @($script:Results | Where-Object { $_.Status -eq 'WARN' })
+$cleanCats  = @($categories | Where-Object { $c = $_; -not ($issues | Where-Object Category -eq $c) -and ($script:Results | Where-Object Category -eq $c) })
+
+$ticketLines = New-Object System.Collections.Generic.List[string]
+$ticketLines.Add(('Diagnostic summary - {0} - {1:yyyy-MM-dd HH:mm}' -f $env:COMPUTERNAME, $reportStart))
+$ticketLines.Add(('User: {0} | OS: {1} | Uptime: {2}' -f $env:USERNAME, $script:OsText, $script:TicketUptime))
+$ticketLines.Add(('Result: {0} ({1} failures, {2} warnings)' -f $overall, $failCount, $warnCount))
+$ticketLines.Add('')
+if ($issues.Count -gt 0) {
+    $ticketLines.Add('Findings:')
+    foreach ($i in $issues) { $ticketLines.Add(('- [{0}] {1}: {2}' -f $i.Status, $i.Check, $i.Detail)) }
+} else {
+    $ticketLines.Add('Findings: none - all checks passed.')
+}
+$ticketLines.Add('')
+$ticketLines.Add("Network: $diagnosis")
+if ($cleanCats.Count -gt 0) { $ticketLines.Add(('No issues found in: {0}' -f ($cleanCats -join ', '))) }
+$ticketLines.Add(('Full report: {0}' -f (Split-Path -Leaf $OutputPath)))
+$ticketText = $ticketLines -join "`r`n"
+
+$ticketHtml = @"
+<div class='actions ticket'><h2>Ticket summary</h2>
+<div class='muted'>Plain-text summary for the ticket notes. Also saved as $(ConvertTo-HtmlSafe (Split-Path -Leaf $ticketPath)).</div>
+<textarea id='ticket' readonly rows='$([math]::Min($ticketLines.Count + 1, 22))'>$(ConvertTo-HtmlSafe $ticketText)</textarea>
+<button onclick="var t=document.getElementById('ticket');t.select();document.execCommand('copy');this.textContent='Copied!';">Copy to clipboard</button>
+</div>
+"@
+
+$html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Diagnostic Report - $(ConvertTo-HtmlSafe $env:COMPUTERNAME)</title>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; background: #f4f6f8; color: #1f2933; }
+  h1 { margin: 0 0 4px 0; font-size: 24px; }
+  h2 { margin: 28px 0 8px 0; font-size: 17px; border-bottom: 2px solid #d9e2ec; padding-bottom: 4px; }
+  .meta { color: #52606d; font-size: 13px; }
+  .overall { display: inline-block; margin: 14px 0; padding: 8px 16px; border-radius: 6px; font-weight: 600; color: #fff; }
+  .overall.ok { background: #2f9e44; } .overall.warn { background: #e8a200; } .overall.fail { background: #c92a2a; }
+  .cards { display: flex; gap: 12px; margin-bottom: 8px; }
+  .card { background: #fff; border-radius: 8px; padding: 10px 18px; box-shadow: 0 1px 3px rgba(0,0,0,.08); text-align: center; min-width: 80px; }
+  .card .n { font-size: 26px; font-weight: 700; } .card .l { font-size: 12px; color: #52606d; }
+  table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.08); font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #e4e7eb; vertical-align: top; }
+  th { background: #334e68; color: #fff; font-weight: 600; } th.s { width: 70px; }
+  tr:hover td { background: #f0f4f8; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; color: #fff; }
+  .badge.ok { background: #2f9e44; } .badge.warn { background: #e8a200; } .badge.fail { background: #c92a2a; } .badge.info { background: #627d98; }
+  footer { margin-top: 24px; font-size: 12px; color: #829ab1; }
+  th.c { width: 220px; } th.d { width: 32%; }
+  td.fix, div.fix { color: #334e68; line-height: 1.5; }
+  code { font-family: Consolas, 'Cascadia Mono', monospace; font-size: 12px; background: #e8eef5; color: #102a43; padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+  .muted { color: #829ab1; font-size: 12px; }
+  .actions { background: #fff; border-left: 4px solid #334e68; border-radius: 6px; padding: 4px 18px 12px 18px; margin-top: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .actions h2 { border: none; margin-top: 12px; }
+  .actions ol { margin: 0; padding-left: 22px; } .actions li { margin: 0 0 12px 0; font-size: 13px; }
+  .actions li .fix { margin-top: 4px; }
+  .ticket textarea { width: 100%; box-sizing: border-box; margin: 8px 0; font-family: Consolas, 'Cascadia Mono', monospace; font-size: 12px; padding: 8px; border: 1px solid #d9e2ec; border-radius: 4px; background: #f8fafc; resize: vertical; }
+  .ticket button { background: #334e68; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; font-size: 13px; cursor: pointer; }
+  .ticket button:hover { background: #243b53; }
+</style>
+</head>
+<body>
+<h1>One-Click Diagnostic Report</h1>
+<div class="meta">Computer: <b>$(ConvertTo-HtmlSafe $env:COMPUTERNAME)</b> &nbsp;|&nbsp; User: $(ConvertTo-HtmlSafe $env:USERNAME) &nbsp;|&nbsp; Generated: $($reportStart.ToString('yyyy-MM-dd HH:mm:ss')) &nbsp;|&nbsp; Runtime: $duration s</div>
+<div class="overall $overallClass">Overall status: $overall</div>
+<div class="cards">
+  <div class="card"><div class="n" style="color:#2f9e44">$okCount</div><div class="l">OK</div></div>
+  <div class="card"><div class="n" style="color:#e8a200">$warnCount</div><div class="l">Warnings</div></div>
+  <div class="card"><div class="n" style="color:#c92a2a">$failCount</div><div class="l">Failures</div></div>
+</div>
+$actionsHtml
+$ticketHtml
+$($sectionsHtml -join "`n")
+$eventHtml
+<footer>Disk threshold: $DiskFreeThresholdPercent% free &nbsp;|&nbsp; Event window: last $EventLogHours h &nbsp;|&nbsp; Generated by Invoke-DiagnosticReport.ps1</footer>
+</body>
+</html>
+"@
+
+try {
+    $outDir = Split-Path -Path $OutputPath -Parent
+    if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    }
+    $html | Out-File -FilePath $OutputPath -Encoding utf8
+    $reportSaved = $true
+} catch {
+    Write-Warning "Could not save HTML report to '$OutputPath': $($_.Exception.Message)"
+    $reportSaved = $false
+}
+
+$ticketSaved = $false
+try {
+    $ticketText | Out-File -FilePath $ticketPath -Encoding utf8
+    $ticketSaved = $true
+} catch {
+    Write-Warning "Could not save ticket summary to '$ticketPath': $($_.Exception.Message)"
+}
+
+$copied = $false
+if (-not $NoClipboard) {
+    try { Set-Clipboard -Value $ticketText -ErrorAction Stop; $copied = $true } catch { }
+}
+
+Write-Host ''
+Write-Host '== Ticket summary ==' -ForegroundColor Cyan
+foreach ($line in $ticketLines) { Write-Host "  $line" }
+
+Write-Host ''
+Write-Host '== Summary ==' -ForegroundColor Cyan
+$summaryColor = switch ($overallClass) { 'ok' { 'Green' } 'warn' { 'Yellow' } default { 'Red' } }
+Write-Host ("  Overall: {0}  ({1} OK, {2} warnings, {3} failures, {4} s)" -f $overall, $okCount, $warnCount, $failCount, $duration) -ForegroundColor $summaryColor
+if ($reportSaved) { Write-Host "  Report saved to:  $OutputPath" }
+if ($ticketSaved) { Write-Host "  Ticket summary:   $ticketPath" }
+if ($copied)      { Write-Host '  Ticket summary copied to clipboard - paste it into the ticket with Ctrl+V.' -ForegroundColor Green }
+if ($reportSaved -and -not $NoOpen) { Invoke-Item -LiteralPath $OutputPath }
+Write-Host ''
+
+Wait-BeforeExit
+
+if ($PassThru) { $script:Results }
+
+#endregion
