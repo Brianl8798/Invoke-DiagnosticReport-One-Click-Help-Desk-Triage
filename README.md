@@ -83,7 +83,7 @@ Built-in tools are great, but each one only shows **part** of the picture, and n
 | Check uptime / pending reboot | Task Manager + Registry | ✅ Included |
 | Network config | `ipconfig /all` | ✅ Included |
 | Recent errors | Event Viewer (manual filtering) | ✅ Last 24h, pre-filtered |
-| Shareable summary | ❌ Screenshots / copy-paste | ✅ One HTML file |
+| Shareable summary | Screenshots / copy-paste | ✅ One HTML file |
 
 This cuts the "can you check X for me?" back-and-forth with the user and gets the ticket to a fix faster.
 
