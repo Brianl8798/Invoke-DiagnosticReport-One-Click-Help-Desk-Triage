@@ -148,7 +148,3 @@ TotalSeconds      : 6.412
 - Option to email the report or upload it to a ticketing system
 - Remote mode (`-ComputerName`) for running against another machine
 - Optional dark theme for the HTML report
-
-## Credits
-
-- Brian Lam — [GitHub](https://github.com/brianlam)
