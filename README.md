@@ -163,4 +163,4 @@ TotalSeconds      : 6.412
 
 ## Credits
 
-- Brian Lam — [GitHub](https://github.com/brianlam)
+- Brian Lam — [GitHub](https://github.com/brianl8798)
