@@ -1,10 +1,6 @@
 # Invoke-DiagnosticReport : One-Click Help Desk Triage
 
 <p align="center">
-  <img src="docs/banner.png" alt="Invoke-DiagnosticReport" width="600">
-</p>
-
-<p align="center">
   A simple, no-install PowerShell script that turns a vague "my computer is slow" ticket into a clean, shareable diagnostic report in seconds.
 </p>
 
@@ -12,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-brightgreen.svg" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell&logoColor=white" alt="PowerShell 5.1+">
   <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white" alt="Windows 10 | 11">
-  <img src="https://img.shields.io/github/last-commit/brianlam/Invoke-DiagnosticReport" alt="Last commit">
+  <img src="https://img.shields.io/badge/Read--only-safe%20to%20run-success" alt="Read-only">
 </p>
 
 > [!TIP]
@@ -23,9 +19,19 @@
 > - 🔒 **Read-only** — the script never changes system settings
 > - 🧪 Built and tested in a **Windows VM home lab**
 
-<p align="center">
-  <img src="docs/report-preview.png" alt="Sample diagnostic report" width="800">
-</p>
+```text
+==================== DIAGNOSTIC REPORT ====================
+ Computer   : LAB-WIN11-01          Generated : 2026-10-28 16:20
+ OS         : Windows 11 Pro 23H2   Uptime    : 3d 4h 12m
+ CPU / RAM  : 4 vCPU / 8 GB (61% used)
+-----------------------------------------------------------
+ [OK]   Disk C:  58.2 GB free of 127 GB (46%)
+ [OK]   Network  Ethernet0 - 192.168.1.50 - Internet reachable
+ [WARN] Pending reboot detected (Windows Update)
+ [WARN] 3 critical/error events in the last 24h
+===========================================================
+ Full HTML report saved to Desktop
+```
 
 ## Table of Contents
 
@@ -57,9 +63,15 @@
 
 ## Demo
 
-<p align="center">
-  <img src="docs/demo.gif" alt="Running Invoke-DiagnosticReport" width="800">
-</p>
+```powershell
+PS C:\Tools\Invoke-DiagnosticReport> .\Invoke-DiagnosticReport.ps1
+[*] Collecting system information...      done
+[*] Collecting storage information...     done
+[*] Collecting network information...     done
+[*] Checking updates / pending reboot...  done
+[*] Reading event logs (last 24h)...      done
+[+] Report saved: C:\Users\brian\Desktop\DiagnosticReport_LAB-WIN11-01_2026-10-28_1620.html
+```
 
 ## Why not just use Task Manager / msinfo32 ... ?
 
@@ -148,3 +160,7 @@ TotalSeconds      : 6.412
 - Option to email the report or upload it to a ticketing system
 - Remote mode (`-ComputerName`) for running against another machine
 - Optional dark theme for the HTML report
+
+## Credits
+
+- Brian Lam — [GitHub](https://github.com/brianlam)
